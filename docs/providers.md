@@ -279,113 +279,81 @@ unanswered tool call gets a placeholder result.
 
 ## OAuth credential forwarding
 
-A caller can supply a current Codex or Claude OAuth access token to llmman
-for one native request. The caller owns login, token refresh, account
-selection, authorization, and network policy.
-llmman does not read or persist a refresh token. Ordinary provider API-key
-routing and the public listener keep their existing behavior.
+Enable `[managed]` in [configuration.md](configuration.md#managed-oauth-forwarding)
+to forward native Codex and Claude requests on the daemon's existing TLS
+listener. The caller owns login, refresh, account selection, authorization,
+and network policy. llmman never persists these request-local OAuth tokens or
+falls back to stored provider keys, environment credentials, or peers.
 
-Set `LLMMAN_MANAGED_CONFIG` to an owner-only JSON file to enable an additional
-loopback HTTPS listener:
+Every forwarding request must come from a loopback connection and supply both:
 
-```json
-{
-  "schemaVersion": 1,
-  "instanceId": "fresh-random-instance-id",
-  "listen": "127.0.0.1:0",
-  "tlsCertFile": "/absolute/path/server-cert.pem",
-  "tlsKeyFile": "/absolute/path/server-key.pem",
-  "connectionKeyFile": "/absolute/path/connection-key",
-  "readyFile": "/absolute/path/ready.json"
-}
+```text
+X-Api-Key: <configured daemon API key>
+Authorization: Bearer <current provider OAuth access token>
+X-LLMMan-Upstream-IP: <policy-authorized public IP for the provider>
 ```
 
-The supervisor creates a fresh certificate/key and random ASCII connection
-key, protects the files and their parent directory, and pins the certificate
-in its client. On Unix the config, private key, and connection-key files must
-have no group/other permissions. On other platforms the supervisor must set
-owner-only file ACLs. All file paths are absolute. Invalid configuration,
-unsupported versions, or non-loopback binds fail startup.
+The daemon key is checked separately and removed before forwarding. An OAuth
+bearer alone cannot authenticate to the daemon. Peer admission uses the actual
+connection address, never `Forwarded` or `X-Forwarded-For`. Neither disabling
+daemon authentication nor configuring an HTTP listener is allowed in managed mode.
 
-Once TLS and the socket are ready, llmman atomically writes the owner-only
-ready document. The supervisor validates its instance ID and child PID, then
-checks the authenticated capabilities response over the pinned connection:
-
-```json
-{
-  "schemaVersion": 1,
-  "instanceId": "fresh-random-instance-id",
-  "pid": 12345,
-  "endpoint": "https://127.0.0.1:45678",
-  "capabilities": ["codex-oauth-forwarding-v1", "claude-oauth-forwarding-v1"]
-}
-```
-
-Every managed request requires `X-LLMMan-Managed-Key` containing the
-connection key. `GET /v1/capabilities` returns the ready document. These
-inference operations are admitted:
-
-| Auth profile | Managed operation | Fixed upstream |
+| Managed operation | Fixed upstream | Required model prefix |
 |---|---|---|
-| `codex-oauth` | `POST /v1/responses` | `https://chatgpt.com/backend-api/codex/responses` |
-| `codex-oauth` | `POST /v1/responses/compact` | `https://chatgpt.com/backend-api/codex/responses/compact` |
-| `claude-oauth` | `POST /v1/messages` | `https://api.anthropic.com/v1/messages` |
-| `claude-oauth` | `POST /v1/messages/count_tokens` | `https://api.anthropic.com/v1/messages/count_tokens` |
+| `POST /api/codex/responses` | `https://chatgpt.com/backend-api/codex/responses` | `llmman.provider/openai/` |
+| `POST /api/codex/responses/compact` | `https://chatgpt.com/backend-api/codex/responses/compact` | `llmman.provider/openai/` |
+| `POST /api/anthropic/messages` | `https://api.anthropic.com/v1/messages` | `llmman.provider/anthropic/` |
+| `POST /api/anthropic/messages/count_tokens` | `https://api.anthropic.com/v1/messages/count_tokens` | `llmman.provider/anthropic/` |
 
-Codex requests require these headers, in addition to the connection key:
+The route selects the provider; no auth-profile header or account-header
+heuristic is needed. `ChatGPT-Account-ID` is optional on Codex requests and is
+never sent to Anthropic. The exact nonempty model suffix is forwarded after
+removing the table's prefix. Other native payload fields are preserved; invalid
+credentials, mismatched model prefixes, and duplicate top-level JSON fields
+are rejected before contacting a provider. Request bodies are bounded to 32 MiB.
 
-```text
-Authorization: Bearer <current access token>
-X-LLMMan-Auth-Profile: codex-oauth
-X-LLMMan-Upstream-IP: <policy-authorized public IP of chatgpt.com>
-ChatGPT-Account-ID: <matching account ID, when supplied>
+The supervisor resolves the fixed provider hostname, authorizes a particular
+IP against its network policy, and supplies that numeric address in
+`X-LLMMan-Upstream-IP`. llmman pins the connection to it while verifying the
+provider's TLS hostname. There is no DNS fallback or caller-controlled URL.
+Special-use addresses, including private networks, loopback, and IPv6 6to4,
+are rejected. Redirects and environment proxy/CA overrides are not used.
+
+Provider extension headers pass through in both directions, including repeated
+values. Hop-by-hop headers, fields named by `Connection`, `Host`, internal
+`X-LLMMan-*` headers, daemon/alternate credentials, and cookies are removed.
+`Content-Length` is regenerated after body changes. The provider bearer and
+Codex account ID are set explicitly. Codex `originator` and `openai-beta` are
+forwarded only when supplied; llmman does not invent a client identity.
+For Claude, llmman merges `oauth-2025-04-20` into `anthropic-beta` and defaults
+`anthropic-version` to `2023-06-01` when absent. The caller supplies any required
+native system content or metadata.
+
+Successful response bodies stream with backpressure and cancellation on
+disconnect. Upstream connection establishment has a 30-second timeout; reads
+have no deadline unless `managed.read_timeout_seconds` is configured. That
+optional timeout applies to response-header waits and individual stalled reads,
+not total generation duration. A quiet generation can exceed it, so choose a
+value appropriate for the workload.
+
+Provider error statuses are preserved with bearer/account values redacted from
+error bodies and response headers. Error bodies above 1 MiB, interrupted reads,
+redirects, and encoded error bodies that cannot be safely redacted produce 502.
+llmman requests uncompressed upstream responses. Transport diagnostics are
+redacted and available with debug logging. A failure after streaming headers
+have been sent terminates the stream instead of changing its status.
+
+`GET /api/version` confirms daemon liveness. Before supplying provider tokens,
+call `GET /api/managed/capabilities` over a trusted TLS connection with the
+same daemon API key, and require the corresponding capability:
+
+```json
+{"capabilities":["codex-oauth-forwarding-v2","claude-oauth-forwarding-v2"]}
 ```
 
-The JSON `model` must be `llmman.provider/openai/<exact-model-id>`.
-
-Claude requests instead use:
-
-```text
-Authorization: Bearer <current access token>
-X-LLMMan-Auth-Profile: claude-oauth
-X-LLMMan-Upstream-IP: <policy-authorized public IP of api.anthropic.com>
-```
-
-The JSON `model` must be `llmman.provider/anthropic/<exact-model-id>`.
-llmman sends the supplied token as a bearer credential, never as `x-api-key`.
-It adds `oauth-2025-04-20` to `anthropic-beta` when absent, preserving other
-beta features, and defaults `anthropic-version` to `2023-06-01` when omitted.
-The caller supplies the native Messages payload, including any client-specific
-system content or metadata required by the provider; llmman does not invent
-client identity or alter prompts.
-
-For both profiles, llmman removes the model prefix and preserves the remaining
-native request, including tools, thinking blocks, cache controls, and
-provider-owned IDs. The caller resolves and authorizes the upstream IP
-against its network policy; llmman pins the connection to that address,
-retaining TLS hostname validation for the profile's fixed host. Non-public
-IPs, duplicate protocol headers, placeholder tokens, mismatched profiles or
-providers, and unsupported operations are rejected. Missing or expired tokens
-never fall back to stored API keys; refresh the token in the caller.
-There is no catalog/custom URL override, peer forwarding, environment-proxy
-fallback, redirect following, Chat Completions fallback, or generation retry.
-
-Only approved Codex protocol/session headers are forwarded (`OpenAI-Beta`,
-`originator`, `session_id`, `conversation_id`, `User-Agent`,
-`x-codex-turn-metadata`, `x-codex-turn-state`, `x-codex-client-version`, and
-`x-codex-beta-features`). Claude forwards `anthropic-version`, `anthropic-beta`,
-`x-app`, and `User-Agent`. Neither profile forwards the other's protocol headers
-or an `x-api-key`. Connection/profile/IP headers never leave llmman.
-Request IDs, retry timing, and provider rate-limit response headers are relayed.
-Native response bodies stream with downstream backpressure and cancellation;
-provider error statuses are preserved, with request credentials redacted
-from error bodies; an error body above 1 MiB is answered as a 502 instead.
-The managed routes have no prompt-history, shell, UI, or administration
-surface. The public listener rejects managed auth profiles.
-For a managed child, also set `LLMMAN_SHELL=off` and `LLMMAN_NOHISTORY=1`, and
-avoid inheriting provider credentials in its startup environment.
-
-The access token is available to this trusted llmman process for the request;
-a compromised process could replay it until provider expiry or revocation.
-The supervisor must invalidate readiness and rotate connection material when
-the child exits or restarts. A stale ready file alone is never authentication.
+These routes bypass prompt-history recording and ordinary provider routing.
+They are disabled by default. The earlier draft's second listener, JSON config,
+ready file, and managed-key/auth-profile headers have been removed; callers of
+that draft must migrate configuration, paths, authentication, and capability
+checks together. A supervisor must bind readiness to the child it launched and
+invalidate it on exit; a version response alone is not a forwarding handshake.

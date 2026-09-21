@@ -18,19 +18,20 @@ impl Drop for Server {
 async fn serve(app: Router) -> Server {
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", socket.local_addr().unwrap());
-    let task = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    let task = tokio::spawn(async move {
+        axum::serve(
+            socket,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     Server { url, task }
 }
 fn state(base: &str) -> ManagedState {
     ManagedState(Arc::new(ManagedInner {
         connection_auth: auth::Policy::with_keys(["connection-secret"]),
-        ready: Ready {
-            schema_version: 1,
-            instance_id: "instance-123".into(),
-            pid: std::process::id(),
-            endpoint: "https://127.0.0.1:45678".into(),
-            capabilities: vec![CAPABILITY, CLAUDE_CAPABILITY],
-        },
+        read_timeout: None,
         clients: std::sync::Mutex::default(),
         test_base: Some(base.into()),
     }))
@@ -46,9 +47,8 @@ fn profile_request(url: &str, operation: &str, profile: Profile) -> reqwest::Req
         .no_proxy()
         .build()
         .unwrap()
-        .post(format!("{url}/v1/{operation}"))
+        .post(format!("{url}{}/{operation}", profile.route_prefix()))
         .header(CONNECTION_KEY, "connection-secret")
-        .header(AUTH_PROFILE, profile.name())
         .header(UPSTREAM_IP, "104.18.2.1")
         .bearer_auth("provider-secret")
 }
@@ -85,8 +85,7 @@ async fn native_requests_preserve_protocol_and_strip_internal_headers() {
             .header("chatgpt-account-id", "account-1")
             .header("session_id", "session-1")
             .header("x-codex-turn-metadata", "{\"request_kind\":\"turn\"}")
-            .header("x-api-key", "unrelated-key")
-            .header("x-arbitrary", "do-not-relay")
+            .header("x-arbitrary", "future-provider-value")
             .json(&body)
             .send()
             .await
@@ -111,15 +110,10 @@ async fn native_requests_preserve_protocol_and_strip_internal_headers() {
         assert_eq!(headers["authorization"], "Bearer provider-secret");
         assert_eq!(headers["chatgpt-account-id"], "account-1");
         assert_eq!(headers["session_id"], "session-1");
-        assert_eq!(headers["originator"], "codex_cli_rs");
-        assert_eq!(headers["openai-beta"], "responses=experimental");
-        for name in [
-            CONNECTION_KEY,
-            AUTH_PROFILE,
-            UPSTREAM_IP,
-            "x-api-key",
-            "x-arbitrary",
-        ] {
+        assert!(!headers.contains_key("originator"));
+        assert!(!headers.contains_key("openai-beta"));
+        assert_eq!(headers["x-arbitrary"], "future-provider-value");
+        for name in [CONNECTION_KEY, UPSTREAM_IP, "x-api-key"] {
             assert!(!headers.contains_key(name));
         }
         let mut expected = body.clone();
@@ -134,7 +128,7 @@ async fn authentication_capabilities_and_inference_only_routes() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     for key in [None, Some("wrong-key"), Some("provider-secret")] {
         let mut req = client
-            .get(format!("{}/v1/capabilities", managed.url))
+            .get(format!("{}/api/managed/capabilities", managed.url))
             .bearer_auth("connection-secret");
         if let Some(key) = key {
             req = req.header(CONNECTION_KEY, key);
@@ -142,7 +136,7 @@ async fn authentication_capabilities_and_inference_only_routes() {
         assert_eq!(req.send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
     let ready: Value = client
-        .get(format!("{}/v1/capabilities", managed.url))
+        .get(format!("{}/api/managed/capabilities", managed.url))
         .header(CONNECTION_KEY, "connection-secret")
         .send()
         .await
@@ -150,8 +144,6 @@ async fn authentication_capabilities_and_inference_only_routes() {
         .json()
         .await
         .unwrap();
-    assert_eq!(ready["schemaVersion"], 1);
-    assert_eq!(ready["instanceId"], "instance-123");
     assert_eq!(
         ready["capabilities"],
         json!([CAPABILITY, CLAUDE_CAPABILITY])
@@ -188,33 +180,6 @@ async fn malformed_profiles_tokens_models_never_reach_upstream() {
     .await;
     let managed = serve(router(state(&upstream.url))).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    for profile in [
-        None,
-        Some("api-key"),
-        Some("codex-oauth,codex-oauth"),
-        Some(""),
-    ] {
-        let mut req = client
-            .post(format!("{}/v1/responses", managed.url))
-            .header(CONNECTION_KEY, "connection-secret")
-            .bearer_auth("provider-secret")
-            .json(&json!({"model":MODEL}));
-        if let Some(profile) = profile {
-            req = req.header(AUTH_PROFILE, profile);
-        }
-        assert_eq!(req.send().await.unwrap().status(), StatusCode::BAD_REQUEST);
-    }
-    assert_eq!(
-        request(&managed.url, "responses")
-            .header(AUTH_PROFILE, "codex-oauth")
-            .header(UPSTREAM_IP, "104.18.2.1")
-            .json(&json!({"model":MODEL}))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::BAD_REQUEST
-    );
     for authorization in [
         "Bearer llmman",
         "Bearer ",
@@ -223,9 +188,8 @@ async fn malformed_profiles_tokens_models_never_reach_upstream() {
         "Bearer a,b",
     ] {
         let r = client
-            .post(format!("{}/v1/responses", managed.url))
+            .post(format!("{}/api/codex/responses", managed.url))
             .header(CONNECTION_KEY, "connection-secret")
-            .header(AUTH_PROFILE, "codex-oauth")
             .header(UPSTREAM_IP, "104.18.2.1")
             .header("authorization", authorization)
             .json(&json!({"model":MODEL}))
@@ -261,27 +225,6 @@ async fn malformed_profiles_tokens_models_never_reach_upstream() {
         StatusCode::BAD_REQUEST
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn public_listener_rejects_managed_profile_before_provider_lookup() {
-    for (profile, operation, model) in [
-        (Profile::Codex, "responses", MODEL),
-        (Profile::Claude, "messages", CLAUDE_MODEL),
-    ] {
-        let public = serve(super::super::build_router(
-            super::super::tests::test_state(),
-            false,
-        ))
-        .await;
-        let response = profile_request(&public.url, operation, profile)
-            .json(&json!({"model":model}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(!response.text().await.unwrap().contains("secret"));
-    }
 }
 
 #[tokio::test]
@@ -378,9 +321,8 @@ async fn concurrent_accounts_remain_paired_on_each_request() {
                 .no_proxy()
                 .build()
                 .unwrap()
-                .post(format!("{url}/v1/responses"))
+                .post(format!("{url}/api/codex/responses"))
                 .header(CONNECTION_KEY, "connection-secret")
-                .header(AUTH_PROFILE, "codex-oauth")
                 .header(UPSTREAM_IP, "104.18.2.1")
                 .bearer_auth(format!("token-{n}"))
                 .header("chatgpt-account-id", format!("account-{n}"))
@@ -465,170 +407,6 @@ async fn streaming_starts_before_completion_and_disconnect_cancels_upstream() {
     }
 }
 
-fn config(directory: &Path) -> Config {
-    Config {
-        schema_version: 1,
-        instance_id: "fixture-instance".into(),
-        listen: "127.0.0.1:0".parse().unwrap(),
-        tls_cert_file: directory.join("cert.pem"),
-        tls_key_file: directory.join("key.pem"),
-        connection_key_file: directory.join("connection-key"),
-        ready_file: directory.join("ready.json"),
-    }
-}
-
-fn write_private(path: &Path, content: impl AsRef<[u8]>) {
-    std::fs::write(path, content).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
-}
-
-fn write_tls_fixture(config: &Config) -> String {
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(["127.0.0.1".to_owned()]).unwrap();
-    let cert_pem = cert.pem();
-    write_private(&config.tls_cert_file, &cert_pem);
-    write_private(&config.tls_key_file, signing_key.serialize_pem());
-    write_private(&config.connection_key_file, b"connection-secret");
-    cert_pem
-}
-
-#[test]
-fn configuration_contract_and_secret_debug_are_fail_closed() {
-    let directory = std::env::temp_dir();
-    let mut config = config(&directory);
-    assert!(config.validate().is_ok());
-    config.schema_version = 2;
-    assert!(config.validate().is_err());
-    config.schema_version = 1;
-    config.listen = "0.0.0.0:0".parse().unwrap();
-    assert!(config.validate().is_err());
-    config.listen = "127.0.0.1:0".parse().unwrap();
-    config.instance_id = "".into();
-    assert!(config.validate().is_err());
-    let fixture = json!({"schemaVersion":1,"instanceId":"fixture","listen":"127.0.0.1:0","tlsCertFile":directory.join("cert.pem"),"tlsKeyFile":directory.join("key.pem"),"connectionKeyFile":directory.join("connection-key"),"readyFile":directory.join("ready.json")});
-    serde_json::from_value::<Config>(fixture)
-        .unwrap()
-        .validate()
-        .unwrap();
-    let mut headers = HeaderMap::new();
-    headers.insert(AUTH_PROFILE, HeaderValue::from_static("codex-oauth"));
-    headers.insert(UPSTREAM_IP, HeaderValue::from_static("104.18.2.1"));
-    headers.insert(
-        "authorization",
-        HeaderValue::from_static("Bearer provider-secret"),
-    );
-    assert!(!format!(
-        "{:?}",
-        Credentials::parse(&headers, Profile::Codex).unwrap()
-    )
-    .contains("provider-secret"));
-}
-
-#[tokio::test]
-async fn tls_listener_publishes_authenticated_readiness_and_cleans_up() {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let directory = std::env::temp_dir().join(format!(
-        "llmman-managed-test-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir(&directory).unwrap();
-    let config = config(&directory);
-    let cert_pem = write_tls_fixture(&config);
-    // `serve_async` installs the provider before binding; the test stands
-    // in for it.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let listener = Listener::bind(config).await.unwrap();
-    let ready: Value =
-        serde_json::from_slice(&std::fs::read(directory.join("ready.json")).unwrap()).unwrap();
-    assert_eq!(ready["schemaVersion"], 1);
-    assert_eq!(ready["instanceId"], "fixture-instance");
-    assert_eq!(ready["pid"], std::process::id());
-    assert_eq!(
-        ready["capabilities"],
-        json!([CAPABILITY, CLAUDE_CAPABILITY])
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(directory.join("ready.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-    let url = ready["endpoint"].as_str().unwrap().to_string();
-    let task = tokio::spawn(listener.serve(std::future::pending()));
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap())
-        .build()
-        .unwrap();
-    let got: Value = client
-        .get(format!("{url}/v1/capabilities"))
-        .header(CONNECTION_KEY, "connection-secret")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(got, ready);
-    assert!(
-        reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
-            .get(format!("{url}/v1/capabilities"))
-            .header(CONNECTION_KEY, "connection-secret")
-            .send()
-            .await
-            .is_err(),
-        "untrusted certificates must fail"
-    );
-    task.abort();
-    let _ = task.await;
-    assert!(!directory.join("ready.json").exists());
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-/// A restarted successor publishes to the same path while this instance
-/// drains; retracting on drop must not take its document down.
-#[tokio::test]
-async fn drop_retracts_only_its_own_ready_file() {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let directory = std::env::temp_dir().join(format!(
-        "llmman-managed-drop-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir(&directory).unwrap();
-    let config = config(&directory);
-    write_tls_fixture(&config);
-    let ready_file = config.ready_file.clone();
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let listener = Listener::bind(config.clone()).await.unwrap();
-    assert!(ready_file.exists());
-    drop(listener);
-    assert!(!ready_file.exists(), "own document is retracted");
-
-    let listener = Listener::bind(config).await.unwrap();
-    let successor = json!({"schemaVersion":1,"instanceId":"fixture-instance","pid":std::process::id().wrapping_add(1),"endpoint":"https://127.0.0.1:1","capabilities":[]});
-    std::fs::write(&ready_file, serde_json::to_vec(&successor).unwrap()).unwrap();
-    drop(listener);
-    let left: Value = serde_json::from_slice(&std::fs::read(&ready_file).unwrap()).unwrap();
-    assert_eq!(left, successor, "a successor's document is left alone");
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
 #[test]
 fn upstream_clients_are_reused_per_profile_and_ip() {
     let state = state("http://127.0.0.1:9");
@@ -705,9 +483,8 @@ async fn upstream_ip_is_required_and_not_forwarded_as_a_header() {
             .no_proxy()
             .build()
             .unwrap()
-            .post(format!("{}/v1/responses", managed.url))
+            .post(format!("{}/api/codex/responses", managed.url))
             .header(CONNECTION_KEY, "connection-secret")
-            .header(AUTH_PROFILE, "codex-oauth")
             .bearer_auth("provider-secret")
             .json(&json!({"model":MODEL}));
         if let Some(ip) = ip {
@@ -771,13 +548,12 @@ async fn claude_preserves_native_messages_and_count_tokens() {
             Some("custom-beta, oauth-2025-04-20"),
         ] {
             let mut req = profile_request(&managed.url, operation, Profile::Claude)
-                .header("x-api-key", "unrelated-key")
                 .header("chatgpt-account-id", "unrelated-account")
                 .header("openai-beta", "unrelated-beta")
                 .header("session_id", "unrelated-session")
                 .header("x-app", "cli")
                 .header("user-agent", "native-client")
-                .header("x-arbitrary", "do-not-relay");
+                .header("x-arbitrary", "future-provider-value");
             if let Some(beta) = beta {
                 req = req
                     .header("anthropic-beta", beta)
@@ -833,14 +609,10 @@ async fn claude_preserves_native_messages_and_count_tokens() {
         );
         for name in [
             CONNECTION_KEY,
-            AUTH_PROFILE,
             UPSTREAM_IP,
             "x-api-key",
             "chatgpt-account-id",
-            "openai-beta",
             "originator",
-            "session_id",
-            "x-arbitrary",
         ] {
             assert!(!headers.contains_key(name), "{name}");
         }
@@ -865,7 +637,6 @@ async fn claude_rejects_invalid_credentials_profiles_and_models_before_forwardin
     let managed = serve(router(state(&upstream.url))).await;
     for operation in ["messages", "messages/count_tokens"] {
         for (profile, model) in [
-            (Profile::Codex, CLAUDE_MODEL),
             (Profile::Claude, MODEL),
             (Profile::Claude, "claude-sonnet-4-5"),
             (Profile::Claude, "llmman.provider/anthropic/"),
@@ -887,11 +658,9 @@ async fn claude_rejects_invalid_credentials_profiles_and_models_before_forwardin
                 .no_proxy()
                 .build()
                 .unwrap()
-                .post(format!("{}/v1/{operation}", managed.url))
+                .post(format!("{}/api/anthropic/{operation}", managed.url))
                 .header(CONNECTION_KEY, "connection-secret")
-                .header(AUTH_PROFILE, "claude-oauth")
-                .header(UPSTREAM_IP, "104.18.2.1")
-                .header("x-api-key", "must-not-be-used");
+                .header(UPSTREAM_IP, "104.18.2.1");
             if let Some(bearer) = bearer {
                 req = req.header("authorization", bearer);
             }
@@ -905,7 +674,6 @@ async fn claude_rejects_invalid_credentials_profiles_and_models_before_forwardin
             );
         }
         for header in [
-            AUTH_PROFILE,
             "authorization",
             "anthropic-version",
             "anthropic-beta",
@@ -931,17 +699,6 @@ async fn claude_rejects_invalid_credentials_profiles_and_models_before_forwardin
         assert_eq!(
             profile_request(&managed.url, operation, Profile::Claude)
                 .body(duplicate)
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-    }
-    for operation in ["responses", "responses/compact"] {
-        assert_eq!(
-            profile_request(&managed.url, operation, Profile::Claude)
-                .json(&json!({"model":CLAUDE_MODEL}))
                 .send()
                 .await
                 .unwrap()
@@ -976,9 +733,8 @@ async fn concurrent_claude_and_codex_credentials_stay_request_local() {
                 .no_proxy()
                 .build()
                 .unwrap()
-                .post(format!("{url}/v1/{operation}"))
+                .post(format!("{url}{}/{operation}", profile.route_prefix()))
                 .header(CONNECTION_KEY, "connection-secret")
-                .header(AUTH_PROFILE, profile.name())
                 .header(UPSTREAM_IP, "104.18.2.1")
                 .bearer_auth(token)
                 .header("chatgpt-account-id", "codex-account")
@@ -998,11 +754,360 @@ async fn concurrent_claude_and_codex_credentials_stay_request_local() {
     assert_eq!(
         codex,
         json!({"bearer":"Bearer codex-secret","account":"codex-account",
-        "claude_beta":null,"codex_beta":"responses=experimental"})
+        "claude_beta":null,"codex_beta":null})
     );
     assert_eq!(
         claude,
         json!({"bearer":"Bearer claude-secret","account":null,
         "claude_beta":CLAUDE_OAUTH_BETA,"codex_beta":null})
     );
+}
+
+#[test]
+fn managed_routes_require_explicit_tls_and_enforced_daemon_auth() {
+    let enabled = || crate::config::Managed {
+        enabled: true,
+        read_timeout: None,
+    };
+    assert!(routes(enabled(), auth::Policy::default(), true).is_err());
+    assert!(routes(enabled(), auth::Policy::with_keys(["key"]).optional(), true).is_err());
+    assert!(routes(enabled(), auth::Policy::with_keys(["key"]), false).is_err());
+    assert!(routes(enabled(), auth::Policy::with_keys(["key"]), true).is_ok());
+    assert!(routes(
+        crate::config::Managed::default(),
+        auth::Policy::default(),
+        false
+    )
+    .is_ok());
+}
+
+#[tokio::test]
+async fn peer_admission_ignores_forwarded_headers_and_refuses_missing_peer() {
+    for peer in [None, Some("192.0.2.1:1234".parse::<SocketAddr>().unwrap())] {
+        let app = router(state("http://127.0.0.1:9")).layer(middleware::from_fn(
+            move |mut req: Request, next: Next| async move {
+                req.extensions_mut().remove::<ConnectInfo<SocketAddr>>();
+                if let Some(peer) = peer {
+                    req.extensions_mut().insert(ConnectInfo(peer));
+                }
+                next.run(req).await
+            },
+        ));
+        let server = serve(app).await;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}/api/managed/capabilities", server.url))
+            .header(CONNECTION_KEY, "connection-secret")
+            .header("x-forwarded-for", "127.0.0.1")
+            .header("forwarded", "for=127.0.0.1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn duplicate_daemon_keys_are_rejected_and_provider_bearer_cannot_authenticate_daemon() {
+    let server = serve(router(state("http://127.0.0.1:9"))).await;
+    let response = request(&server.url, "responses")
+        .header(CONNECTION_KEY, "connection-secret")
+        .json(&json!({"model":MODEL}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Also fail closed if a future caller accidentally constructs an open policy.
+    let mut managed = state("http://127.0.0.1:9");
+    Arc::get_mut(&mut managed.0).unwrap().connection_auth = auth::Policy::default();
+    let server = serve(router(managed)).await;
+    let response = request(&server.url, "responses")
+        .json(&json!({"model":MODEL}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn extension_headers_survive_and_hop_by_hop_fields_are_stripped_both_ways() {
+    let upstream = serve(
+        Router::new().fallback(post(|headers: HeaderMap| async move {
+            assert_eq!(headers["originator"], "actual-client");
+            assert_eq!(headers["openai-beta"], "future-beta");
+            assert_eq!(headers.get_all("x-future-provider").iter().count(), 2);
+            for name in [
+                "x-drop",
+                "proxy-authorization",
+                "x-llmman-managed-key",
+                "cookie",
+                "x-api-key",
+            ] {
+                assert!(!headers.contains_key(name), "{name}");
+            }
+            assert_eq!(headers["authorization"], "Bearer provider-secret");
+            (
+                [
+                    ("connection", "x-drop"),
+                    ("x-drop", "private-hop"),
+                    ("x-future-response", "preserved"),
+                    ("proxy-authenticate", "private-hop"),
+                    ("x-llmman-private", "private-hop"),
+                    ("set-cookie", "private-cookie"),
+                ],
+                "ok",
+            )
+        })),
+    )
+    .await;
+    let server = serve(router(state(&upstream.url))).await;
+    let response = request(&server.url, "responses")
+        .header("originator", "actual-client")
+        .header("openai-beta", "future-beta")
+        .header("x-future-provider", "a")
+        .header("x-future-provider", "b")
+        .header("connection", "X-Drop")
+        .header("x-drop", "private-hop")
+        .header("proxy-authorization", "private-hop")
+        .header("cookie", "private-cookie")
+        .header("x-llmman-managed-key", "obsolete-key")
+        .json(&json!({"model":MODEL}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-future-response"], "preserved");
+    for name in [
+        "connection",
+        "x-drop",
+        "proxy-authenticate",
+        "x-llmman-private",
+        "set-cookie",
+    ] {
+        assert!(!response.headers().contains_key(name), "{name}");
+    }
+    assert_eq!(response.text().await.unwrap(), "ok");
+}
+
+#[tokio::test]
+async fn oversized_or_encoded_provider_errors_are_bounded_and_not_relayed() {
+    for encoded in [false, true] {
+        let upstream = serve(Router::new().fallback(move || async move {
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(
+                    "content-encoding",
+                    if encoded { "gzip" } else { "identity" },
+                )
+                .body(Body::from(if encoded {
+                    "provider-secret".to_string()
+                } else {
+                    "x".repeat(ERROR_LIMIT + 1)
+                }))
+                .unwrap()
+        }))
+        .await;
+        let server = serve(router(state(&upstream.url))).await;
+        let response = request(&server.url, "responses")
+            .json(&json!({"model":MODEL}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.text().await.unwrap().contains("provider-secret"));
+    }
+}
+
+#[tokio::test]
+async fn configured_read_timeout_bounds_header_and_body_stalls_without_total_deadline() {
+    use std::time::Duration;
+    let upstream = serve(Router::new().route(
+        "/responses",
+        post(|| async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            "finished"
+        }),
+    ))
+    .await;
+    for (timeout, expected) in [
+        (None, StatusCode::OK),
+        (Some(Duration::from_millis(20)), StatusCode::BAD_GATEWAY),
+    ] {
+        let mut managed = state(&upstream.url);
+        Arc::get_mut(&mut managed.0).unwrap().read_timeout = timeout;
+        let server = serve(router(managed)).await;
+        let response = request(&server.url, "responses")
+            .json(&json!({"model":MODEL}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    // A continuously active stream outlives the read timeout; a stalled one ends.
+    for stall in [false, true] {
+        let upstream = serve(Router::new().fallback(post(move || async move {
+            Body::from_stream(futures::stream::unfold(0, move |n| async move {
+                if n == 12 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(if stall && n == 1 {
+                    300
+                } else {
+                    10
+                }))
+                .await;
+                Some((
+                    Ok::<_, std::io::Error>(Bytes::from_static(b"chunk\n")),
+                    n + 1,
+                ))
+            }))
+        })))
+        .await;
+        let mut managed = state(&upstream.url);
+        Arc::get_mut(&mut managed.0).unwrap().read_timeout = Some(Duration::from_millis(100));
+        let server = serve(router(managed)).await;
+        let response = request(&server.url, "responses")
+            .json(&json!({"model":MODEL}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.is_err(), stall);
+    }
+}
+
+/// A real TLS socket, also used to check the production transport's DNS pin
+/// and provider hostname verification. No request URL override is needed.
+async fn serve_tls(app: Router, name: &str) -> (Server, reqwest::Certificate, u16) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed([name.to_string()]).unwrap();
+    let pem = cert.pem();
+    let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+        pem.as_bytes().to_vec(),
+        signing_key.serialize_pem().into_bytes(),
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let listener = listener.into_std().unwrap();
+    let task = tokio::spawn(async move {
+        axum_server::from_tcp_rustls(listener, tls)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .unwrap();
+    });
+    (
+        Server {
+            url: format!("https://127.0.0.1:{port}"),
+            task,
+        },
+        reqwest::Certificate::from_pem(pem.as_bytes()).unwrap(),
+        port,
+    )
+}
+
+#[tokio::test]
+async fn production_transport_pins_ip_and_verifies_provider_tls_hostname() {
+    for profile in [Profile::Codex, Profile::Claude] {
+        let app = Router::new().fallback(|req: Request| async move {
+            let authority = req
+                .uri()
+                .authority()
+                .map(|a| a.as_str())
+                .or_else(|| req.headers().get("host").and_then(|h| h.to_str().ok()))
+                .unwrap();
+            Json(json!({"host": authority}))
+        });
+        let (_server, cert, port) = serve_tls(app, profile.host()).await;
+        let url = format!("https://{}:{port}/responses", profile.host());
+        let client = upstream_client_builder(profile, "127.0.0.1".parse().unwrap(), None)
+            .add_root_certificate(cert.clone())
+            .build()
+            .unwrap();
+        let body: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+        assert_eq!(body["host"], format!("{}:{port}", profile.host()));
+        let wrong_ip = upstream_client_builder(profile, "127.0.0.2".parse().unwrap(), None)
+            .add_root_certificate(cert.clone())
+            .connect_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        assert!(
+            wrong_ip.get(&url).send().await.is_err(),
+            "must not fall back to DNS"
+        );
+        let untrusted = upstream_client_builder(profile, "127.0.0.1".parse().unwrap(), None)
+            .build()
+            .unwrap();
+        assert!(untrusted.get(&url).send().await.is_err());
+        let (_wrong_server, wrong_cert, port) = serve_tls(Router::new(), "wrong.example").await;
+        let wrong_name = upstream_client_builder(profile, "127.0.0.1".parse().unwrap(), None)
+            .add_root_certificate(wrong_cert)
+            .build()
+            .unwrap();
+        assert!(wrong_name
+            .get(format!("https://{}:{port}/", profile.host()))
+            .send()
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn shared_tls_listener_serves_public_and_authenticated_managed_routes() {
+    let upstream = serve(
+        Router::new().fallback(post(|headers: HeaderMap| async move {
+            assert_eq!(headers["authorization"], "Bearer provider-secret");
+            assert!(!headers.contains_key(CONNECTION_KEY));
+            "forwarded"
+        })),
+    )
+    .await;
+    let mut app_state = super::super::tests::test_state();
+    Arc::get_mut(&mut app_state.0).unwrap().auth = auth::Policy::with_keys(["connection-secret"]);
+    let app = super::super::build_router(app_state, false).merge(router(state(&upstream.url)));
+    let (server, cert, _) = serve_tls(app, "127.0.0.1").await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(cert)
+        .build()
+        .unwrap();
+    for path in ["/api/version", "/api/managed/capabilities"] {
+        assert_eq!(
+            client
+                .get(format!("{}{path}", server.url))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = client
+            .get(format!("{}{path}", server.url))
+            .header(CONNECTION_KEY, "connection-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if path.ends_with("capabilities") {
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["capabilities"],
+                json!([CAPABILITY, CLAUDE_CAPABILITY])
+            );
+        }
+    }
+    let response = client
+        .post(format!("{}/api/codex/responses", server.url))
+        .header(CONNECTION_KEY, "connection-secret")
+        .header(UPSTREAM_IP, "104.18.2.1")
+        .bearer_auth("provider-secret")
+        .json(&json!({"model":MODEL}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "forwarded");
 }

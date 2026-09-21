@@ -1,32 +1,29 @@
-//! A supervisor-owned, inference-only TLS listener. Its connection key is
-//! independent of the request-local provider bearer; neither can fall back to
-//! the public daemon's keys, provider catalog, environment, or peers.
+//! Native OAuth forwarding on the daemon's TLS listener. These routes have
+//! mandatory daemon-key authentication and loopback peer admission, and bypass
+//! prompt history, provider credential fallback, and peer routing.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::{auth, AppError};
 
-pub(super) const AUTH_PROFILE: &str = "x-llmman-auth-profile";
-const CONNECTION_KEY: &str = "x-llmman-managed-key";
+const CONNECTION_KEY: &str = "x-api-key";
 const UPSTREAM_IP: &str = "x-llmman-upstream-ip";
-const CAPABILITY: &str = "codex-oauth-forwarding-v1";
-const CLAUDE_CAPABILITY: &str = "claude-oauth-forwarding-v1";
+const CAPABILITY: &str = "codex-oauth-forwarding-v2";
+const CLAUDE_CAPABILITY: &str = "claude-oauth-forwarding-v2";
 const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const ERROR_LIMIT: usize = 1024 * 1024;
@@ -34,19 +31,6 @@ const ERROR_LIMIT: usize = 1024 * 1024;
 /// supervisor pins a handful of resolved addresses, so this is a leak
 /// guard rather than an eviction policy: past it the map starts over.
 const CLIENT_CACHE_LIMIT: usize = 64;
-const CODEX_REQUEST_HEADERS: &[&str] = &[
-    "openai-beta",
-    "originator",
-    "session_id",
-    "conversation_id",
-    "x-codex-turn-metadata",
-    "x-codex-turn-state",
-    "x-codex-client-version",
-    "x-codex-beta-features",
-    "user-agent",
-];
-const CLAUDE_REQUEST_HEADERS: &[&str] = &["anthropic-version", "x-app", "user-agent"];
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Profile {
     Codex,
@@ -54,13 +38,6 @@ enum Profile {
 }
 
 impl Profile {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Codex => "codex-oauth",
-            Self::Claude => "claude-oauth",
-        }
-    }
-
     fn host(self) -> &'static str {
         match self {
             Self::Codex => "chatgpt.com",
@@ -82,122 +59,40 @@ impl Profile {
         }
     }
 
-    fn request_headers(self) -> &'static [&'static str] {
+    #[cfg(test)]
+    fn route_prefix(self) -> &'static str {
         match self {
-            Self::Codex => CODEX_REQUEST_HEADERS,
-            Self::Claude => CLAUDE_REQUEST_HEADERS,
+            Self::Codex => "/api/codex",
+            Self::Claude => "/api/anthropic",
         }
     }
 }
 
-const RESPONSE_HEADERS: &[&str] = &[
-    "content-type",
-    "x-request-id",
-    "request-id",
-    "anthropic-ratelimit-requests-limit",
-    "anthropic-ratelimit-requests-remaining",
-    "anthropic-ratelimit-requests-reset",
-    "anthropic-ratelimit-tokens-limit",
-    "anthropic-ratelimit-tokens-remaining",
-    "anthropic-ratelimit-tokens-reset",
-    "anthropic-ratelimit-input-tokens-limit",
-    "anthropic-ratelimit-input-tokens-remaining",
-    "anthropic-ratelimit-input-tokens-reset",
-    "anthropic-ratelimit-output-tokens-limit",
-    "anthropic-ratelimit-output-tokens-remaining",
-    "anthropic-ratelimit-output-tokens-reset",
-    "retry-after",
-    "x-codex-turn-state",
-    "x-ratelimit-limit-requests",
-    "x-ratelimit-remaining-requests",
-    "x-ratelimit-reset-requests",
-    "x-ratelimit-limit-tokens",
-    "x-ratelimit-remaining-tokens",
-    "x-ratelimit-reset-tokens",
-];
-
-#[derive(Deserialize)]
-#[cfg_attr(test, derive(Clone))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct Config {
-    schema_version: u32,
-    instance_id: String,
-    listen: SocketAddr,
-    tls_cert_file: PathBuf,
-    tls_key_file: PathBuf,
-    connection_key_file: PathBuf,
-    ready_file: PathBuf,
-}
-
-impl Config {
-    pub(super) fn from_env() -> Result<Option<Self>> {
-        let Some(path) = std::env::var_os("LLMMAN_MANAGED_CONFIG") else {
-            return Ok(None);
-        };
-        let bytes = read_private_file(Path::new(&path))?;
-        let config: Self = serde_json::from_slice(&bytes).context("parse LLMMAN_MANAGED_CONFIG")?;
-        config.validate()?;
-        Ok(Some(config))
+/// Validates opt-in before any socket binds. Ordinary daemon auth may be
+/// optional on loopback, but delegated OAuth forwarding never is.
+pub(super) fn routes(
+    config: crate::config::Managed,
+    policy: auth::Policy,
+    tls: bool,
+) -> Result<Router> {
+    if !config.enabled {
+        return Ok(Router::new());
     }
-
-    fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.schema_version == 1,
-            "unsupported managed config schemaVersion"
-        );
-        anyhow::ensure!(
-            !self.instance_id.trim().is_empty(),
-            "managed instanceId must not be empty"
-        );
-        anyhow::ensure!(
-            self.listen.ip().is_loopback(),
-            "managed listener must bind a loopback address"
-        );
-        for path in [
-            &self.tls_cert_file,
-            &self.tls_key_file,
-            &self.connection_key_file,
-            &self.ready_file,
-        ] {
-            anyhow::ensure!(path.is_absolute(), "managed file paths must be absolute");
-        }
-        Ok(())
-    }
-}
-
-fn read_private_file(path: &Path) -> Result<Vec<u8>> {
-    let metadata = std::fs::metadata(path).context("read managed file metadata")?;
     anyhow::ensure!(
-        metadata.is_file() && metadata.len() <= BODY_LIMIT as u64,
-        "managed configuration must be a bounded regular file"
+        tls,
+        "managed forwarding requires LLMMAN_TLS_CERT/LLMMAN_TLS_KEY"
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        anyhow::ensure!(
-            metadata.permissions().mode() & 0o077 == 0,
-            "managed secret/configuration files must be owner-only"
-        );
-    }
-    std::fs::read(path).context("read managed file")
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Ready {
-    schema_version: u32,
-    instance_id: String,
-    pid: u32,
-    endpoint: String,
-    capabilities: Vec<&'static str>,
-}
-
-/// The fields of a published ready document that identify its writer.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReadyIdentity {
-    instance_id: String,
-    pid: u32,
+    anyhow::ensure!(
+        policy.enforced(),
+        "managed forwarding requires daemon API keys and LLMMAN_AUTH must not be off"
+    );
+    Ok(router(ManagedState(Arc::new(ManagedInner {
+        connection_auth: policy,
+        read_timeout: config.read_timeout,
+        clients: Mutex::default(),
+        #[cfg(test)]
+        test_base: None,
+    }))))
 }
 
 #[derive(Clone)]
@@ -205,7 +100,7 @@ struct ManagedState(Arc<ManagedInner>);
 
 struct ManagedInner {
     connection_auth: auth::Policy,
-    ready: Ready,
+    read_timeout: Option<std::time::Duration>,
     clients: Mutex<HashMap<(Profile, IpAddr), reqwest::Client>>,
     // No production configuration or request may replace the fixed endpoint.
     #[cfg(test)]
@@ -220,14 +115,7 @@ impl ManagedInner {
         if let Some(client) = clients.get(&(profile, ip)) {
             return Ok(client.clone());
         }
-        // Do not inherit HTTP(S)_PROXY/ALL_PROXY or LLMMAN_TLS_CA. This profile
-        // promises its supervisor exactly this validated HTTPS destination.
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .resolve(profile.host(), SocketAddr::new(ip, 443))
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .read_timeout(std::time::Duration::from_secs(60))
+        let client = upstream_client_builder(profile, ip, self.read_timeout)
             .build()
             .context("build managed provider transport")?;
         if clients.len() >= CLIENT_CACHE_LIMIT {
@@ -238,120 +126,31 @@ impl ManagedInner {
     }
 }
 
-pub(super) struct Listener {
-    socket: Option<std::net::TcpListener>,
-    tls: axum_server::tls_rustls::RustlsConfig,
-    state: ManagedState,
-    ready_file: PathBuf,
-}
-
-impl Listener {
-    /// Requires the process-level rustls provider to be installed already;
-    /// `serve_async` does that once before any listener is built.
-    pub(super) async fn bind(config: Config) -> Result<Self> {
-        let key = read_private_file(&config.connection_key_file)?;
-        let key = std::str::from_utf8(&key)
-            .context("managed connection key must be ASCII")?
-            .trim();
-        anyhow::ensure!(
-            !key.is_empty() && key.bytes().all(|c| c.is_ascii_graphic()),
-            "managed connection key must be nonempty printable ASCII"
-        );
-        // The private key is checked separately so the TLS library does not
-        // quietly load a broadly readable credential.
-        let cert = std::fs::read(&config.tls_cert_file).context("read managed TLS certificate")?;
-        let tls_key = read_private_file(&config.tls_key_file)?;
-        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert, tls_key)
-            .await
-            .context("load managed TLS certificate/key")?;
-        let socket = tokio::net::TcpListener::bind(config.listen)
-            .await
-            .context("bind managed listener")?;
-        let ready = Ready {
-            schema_version: 1,
-            instance_id: config.instance_id,
-            pid: std::process::id(),
-            endpoint: format!("https://{}", socket.local_addr()?),
-            capabilities: vec![CAPABILITY, CLAUDE_CAPABILITY],
-        };
-        let state = ManagedState(Arc::new(ManagedInner {
-            connection_auth: auth::Policy::with_keys([key]),
-            ready,
-            clients: Mutex::default(),
-            #[cfg(test)]
-            test_base: None,
-        }));
-        let listener = Self {
-            socket: Some(socket.into_std()?),
-            tls,
-            state,
-            ready_file: config.ready_file,
-        };
-        write_ready(&listener.ready_file, &listener.state.0.ready)?;
-        Ok(listener)
+/// Pins the supervisor-authorized address while retaining the provider's TLS
+/// name. Never inherit proxy/CA overrides or redirect delegated credentials.
+fn upstream_client_builder(
+    profile: Profile,
+    ip: IpAddr,
+    read_timeout: Option<std::time::Duration>,
+) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder()
+        .no_proxy()
+        .resolve(profile.host(), SocketAddr::new(ip, 443))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(30));
+    match read_timeout {
+        Some(timeout) => builder.read_timeout(timeout),
+        None => builder,
     }
-
-    /// Serves until `shutdown` resolves (the same signal the public
-    /// listener drains on, so one Ctrl-C stops both) and the in-flight
-    /// requests have drained.
-    pub(super) async fn serve(
-        mut self,
-        shutdown: impl Future<Output = ()> + Send + 'static,
-    ) -> Result<()> {
-        let handle = axum_server::Handle::new();
-        let shutdown = tokio::spawn({
-            let handle = handle.clone();
-            async move {
-                shutdown.await;
-                handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
-            }
-        });
-        let result = axum_server::from_tcp_rustls(
-            self.socket.take().expect("listener present"),
-            self.tls.clone(),
-        )
-        .handle(handle)
-        .serve(router(self.state.clone()).into_make_service())
-        .await;
-        shutdown.abort();
-        result.context("serve managed inference")
-    }
-}
-
-impl Drop for Listener {
-    /// Retracts this instance's own ready document. A supervisor that
-    /// restarts the child reuses the same path, so a successor may have
-    /// published there while this instance was still draining; its
-    /// document is left alone.
-    fn drop(&mut self) {
-        if ready_file_is_ours(&self.ready_file, &self.state.0.ready) {
-            let _ = std::fs::remove_file(&self.ready_file);
-        }
-    }
-}
-
-fn ready_file_is_ours(path: &Path, ready: &Ready) -> bool {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ReadyIdentity>(&bytes).ok())
-        .is_some_and(|published| {
-            published.instance_id == ready.instance_id && published.pid == ready.pid
-        })
-}
-
-fn write_ready(path: &Path, ready: &Ready) -> Result<()> {
-    // Owner-only whatever the umask: the document names a live endpoint.
-    crate::fsutil::write_atomic_with_mode(path, &serde_json::to_vec(ready)?, 0o600)
-        .context("publish managed ready file")
 }
 
 fn router(state: ManagedState) -> Router {
     Router::new()
-        .route("/v1/capabilities", get(capabilities))
-        .route("/v1/responses", post(responses))
-        .route("/v1/responses/compact", post(compact))
-        .route("/v1/messages", post(messages))
-        .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/api/managed/capabilities", get(capabilities))
+        .route("/api/codex/responses", post(responses))
+        .route("/api/codex/responses/compact", post(compact))
+        .route("/api/anthropic/messages", post(messages))
+        .route("/api/anthropic/messages/count_tokens", post(count_tokens))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -365,23 +164,36 @@ async fn require_connection(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let accepted = single_header(req.headers(), CONNECTION_KEY)
-        .ok()
-        .flatten()
-        .is_some_and(|key| state.0.connection_auth.accepts(key));
+    // Only connection metadata is authoritative; forwarded IP headers are not.
+    let local = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|peer| peer.0.ip().is_loopback());
+    if !local {
+        return error(
+            StatusCode::FORBIDDEN,
+            "managed forwarding requires a loopback peer",
+        )
+        .into_response();
+    }
+    let accepted = state.0.connection_auth.enforced()
+        && single_header(req.headers(), CONNECTION_KEY)
+            .ok()
+            .flatten()
+            .is_some_and(|key| state.0.connection_auth.accepts(key));
     req.headers_mut().remove(CONNECTION_KEY);
     if !accepted {
         return error(
             StatusCode::UNAUTHORIZED,
-            "managed connection authentication required",
+            "managed daemon authentication required",
         )
         .into_response();
     }
     next.run(req).await
 }
 
-async fn capabilities(State(state): State<ManagedState>) -> Json<Ready> {
-    Json(state.0.ready.clone())
+async fn capabilities() -> Json<Value> {
+    Json(serde_json::json!({"capabilities": [CAPABILITY, CLAUDE_CAPABILITY]}))
 }
 
 /// Deliberately has no derived Debug/Serialize and never enters shared state.
@@ -416,12 +228,6 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a st
 
 impl Credentials {
     fn parse(headers: &HeaderMap, profile: Profile) -> Result<Self, AppError> {
-        if single_header(headers, AUTH_PROFILE)? != Some(profile.name()) {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "managed auth profile does not match the requested operation",
-            ));
-        }
         let upstream_ip = single_header(headers, UPSTREAM_IP)?
             .and_then(|ip| ip.parse::<IpAddr>().ok())
             .filter(public_upstream_ip)
@@ -589,6 +395,57 @@ fn unique_object<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_map(ObjectVisitor)
 }
 
+/// Forward extensions without maintaining a provider-specific allowlist.
+/// Strip connection-nominated fields too, and regenerate framing for JSON
+/// rewriting/error redaction. Authentication is set explicitly afterward.
+fn forward_headers(headers: &HeaderMap) -> HeaderMap {
+    let connection_fields: Vec<_> = headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .collect();
+    let mut forwarded = HeaderMap::new();
+    for (name, value) in headers {
+        let name_str = name.as_str();
+        if matches!(
+            name_str,
+            "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailer"
+                | "upgrade"
+                | "host"
+                | "content-length"
+                | "authorization"
+                | "x-api-key"
+                | "x-goog-api-key"
+                | "cookie"
+                | "set-cookie"
+                | "chatgpt-account-id"
+        ) || name_str.starts_with("proxy-")
+            || name_str.starts_with("x-llmman-")
+            || connection_fields
+                .iter()
+                .any(|field| name_str.eq_ignore_ascii_case(field))
+        {
+            continue;
+        }
+        forwarded.append(name.clone(), value.clone());
+    }
+    forwarded
+}
+
+/// Never put request URLs, bearer credentials, or account IDs in diagnostics.
+fn log_upstream_error(credentials: &Credentials, err: reqwest::Error) {
+    crate::debug_log!(
+        "managed provider transport: {}",
+        credentials.redact(err.without_url().to_string())
+    );
+}
+
 async fn forward(
     state: ManagedState,
     headers: HeaderMap,
@@ -611,7 +468,7 @@ async fn forward(
         .ok_or_else(|| {
             error(
                 StatusCode::BAD_REQUEST,
-                "managed model must match the auth profile provider and include a model ID",
+                "managed model must match the route provider and include a model ID",
             )
         })?
         .to_owned();
@@ -622,33 +479,35 @@ async fn forward(
     let client = state
         .0
         .upstream_client(profile, credentials.upstream_ip)
-        .map_err(|_| {
+        .map_err(|err| {
+            crate::debug_log!(
+                "managed provider transport setup: {}",
+                credentials.redact(err.to_string())
+            );
             error(
                 StatusCode::BAD_GATEWAY,
                 "provider upstream transport unavailable",
             )
         })?;
+    let mut forwarded = forward_headers(&headers);
+    forwarded.remove("content-type");
+    forwarded.remove("accept-encoding");
+    if profile == Profile::Claude {
+        // These are singular protocol fields, unlike general extension headers.
+        single_header(&headers, "anthropic-version")?;
+        forwarded.remove("anthropic-beta");
+    }
+    forwarded.insert("authorization", credentials.authorization.clone());
+    if let Some(account) = &credentials.account {
+        forwarded.insert("chatgpt-account-id", account.clone());
+    }
     let mut request = client
         .post(format!("{base}{operation}"))
-        .header("authorization", credentials.authorization.clone())
+        .headers(forwarded)
+        .header("accept-encoding", "identity")
         .json(&body);
-    if let Some(account) = &credentials.account {
-        request = request.header("chatgpt-account-id", account);
-    }
-    for name in profile.request_headers() {
-        if let Some(value) = single_header(&headers, name)? {
-            request = request.header(*name, value);
-        }
-    }
     match profile {
-        Profile::Codex => {
-            if !headers.contains_key("originator") {
-                request = request.header("originator", "codex_cli_rs");
-            }
-            if !headers.contains_key("openai-beta") {
-                request = request.header("openai-beta", "responses=experimental");
-            }
-        }
+        Profile::Codex => {}
         Profile::Claude => {
             if !headers.contains_key("anthropic-version") {
                 request = request.header("anthropic-version", "2023-06-01");
@@ -667,7 +526,8 @@ async fn forward(
             request = request.header("anthropic-beta", beta);
         }
     }
-    let mut upstream = request.send().await.map_err(|_| {
+    let mut upstream = request.send().await.map_err(|err| {
+        log_upstream_error(&credentials, err);
         error(
             StatusCode::BAD_GATEWAY,
             "provider upstream connection failed",
@@ -681,16 +541,26 @@ async fn forward(
         ));
     }
     let mut response = Response::builder().status(status);
-    for name in RESPONSE_HEADERS {
-        if let Some(value) = upstream.headers().get(*name) {
-            if let Ok(value) = value.to_str() {
-                response = response.header(*name, credentials.redact(value.to_owned()));
-            }
+    for (name, value) in &forward_headers(upstream.headers()) {
+        if let Ok(value) = value.to_str() {
+            response = response.header(name, credentials.redact(value.to_owned()));
         }
     }
     let body = if status.is_client_error() || status.is_server_error() {
+        if upstream
+            .headers()
+            .get_all("content-encoding")
+            .iter()
+            .any(|value| value.as_bytes() != b"identity")
+        {
+            return Err(error(
+                StatusCode::BAD_GATEWAY,
+                "encoded provider error body refused",
+            ));
+        }
         let mut bytes = Vec::new();
-        while let Some(chunk) = upstream.chunk().await.map_err(|_| {
+        while let Some(chunk) = upstream.chunk().await.map_err(|err| {
+            log_upstream_error(&credentials, err);
             error(
                 StatusCode::BAD_GATEWAY,
                 "provider upstream error body interrupted",
@@ -708,8 +578,11 @@ async fn forward(
     } else {
         // No detached pump: dropping the downstream body drops the reqwest
         // stream and cancels the upstream. Never retry or buffer generation.
-        Body::from_stream(upstream.bytes_stream().map(|chunk| {
-            chunk.map_err(|_| std::io::Error::other("provider upstream stream interrupted"))
+        Body::from_stream(upstream.bytes_stream().map(move |chunk| {
+            chunk.map_err(|err| {
+                log_upstream_error(&credentials, err);
+                std::io::Error::other("provider upstream stream interrupted")
+            })
         }))
     };
     response.body(body).map_err(|_| {

@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Args;
-use futures::{FutureExt as _, StreamExt};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -105,7 +105,6 @@ Environment Variables:
       LLMMAN_TLS_CERT                PEM certificate chain to terminate TLS with (with LLMMAN_TLS_KEY)
       LLMMAN_TLS_KEY                 PEM private key for LLMMAN_TLS_CERT
       LLMMAN_TLS_CA                  PEM bundle of extra roots to trust when reaching peers (and, for the CLI, the daemon)
-      LLMMAN_MANAGED_CONFIG          Owner-only JSON configuration for an additional authenticated loopback TLS inference listener
       LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM/SGLang when set (default 262144 for llama-server)
       LLMMAN_HYBRID_LOCAL_BYTES      Largest request a hybrid pair serves locally, in bytes (0 disables; default: from the context length)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
@@ -3787,11 +3786,15 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         );
     }
     let tls = tls_from_env()?;
-    let managed_config = managed::Config::from_env()?;
-    // Both rustls providers are compiled in (reqwest's, the AWS SDK's), so
-    // none is the default until one is installed. Once, here, before either
-    // listener builds a TLS config.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let managed_config = crate::config::managed().map_err(anyhow::Error::msg)?;
+    if managed_config.enabled {
+        if let Some((_, key)) = &tls {
+            crate::config::owner_readable_only(key)
+                .map_err(anyhow::Error::msg)
+                .context("managed TLS private key permissions")?;
+        }
+    }
+    let managed_routes = managed::routes(managed_config, auth.clone(), tls.is_some())?;
     anyhow::ensure!(
         tls.is_some() == crate::daemon::tls_scheme(),
         "LLMMAN_HOST and LLMMAN_TLS_CERT/LLMMAN_TLS_KEY disagree: an https:// host needs the \
@@ -3843,7 +3846,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         client,
     }));
 
-    let app = build_router(state.clone(), metrics_enabled_from_env());
+    // Managed routes have their own mandatory auth and bypass prompt logging.
+    let app = build_router(state.clone(), metrics_enabled_from_env()).merge(managed_routes);
 
     // Before the listener binds, so uptime counts from the daemon coming
     // up rather than from whenever something first scraped it.
@@ -3858,13 +3862,6 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    // Prepare the authenticated TLS socket before publishing readiness. It
-    // only forwards to its fixed providers: no model manager, no
-    // public/admin/prompt-log layers.
-    let managed = match managed_config {
-        Some(config) => Some(managed::Listener::bind(config).await?),
-        None => None,
-    };
     eprintln!(
         "llmman serve listening on {addr}{}",
         if tls.is_some() { " (TLS)" } else { "" }
@@ -3911,59 +3908,42 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         }
     }
 
-    // One signal, resolved once, drains every listener: `shared` hands each
-    // a clone that completes together, so Ctrl-C installs one handler set
-    // and logs the shutdown once.
-    let shutdown = shutdown_signal().shared();
-    let public_server = async {
-        match tls {
-            None => {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(shutdown.clone())
-                    .await?
-            }
-            Some((cert, key)) => {
-                let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "load TLS certificate {} and key {}",
-                            cert.display(),
-                            key.display()
-                        )
-                    })?;
-                let handle = axum_server::Handle::new();
-                tokio::spawn({
-                    let handle = handle.clone();
-                    let shutdown = shutdown.clone();
-                    async move {
-                        shutdown.await;
-                        handle.graceful_shutdown(Some(Duration::from_secs(30)));
-                    }
-                });
-                axum_server::from_tcp_rustls(listener.into_std()?, config)
-                    .handle(handle)
-                    .serve(app.into_make_service())
-                    .await?
-            }
+    match tls {
+        None => {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?
         }
-        Ok::<(), anyhow::Error>(())
-    };
-    // `join`, not `try_join`: a failure on the managed listener must not
-    // drop the public server mid-request or skip the unload below. Its
-    // error is logged as it happens (its ready file is retracted as its
-    // listener drops) and reported once the public server has drained.
-    let (public, managed) = match managed {
-        Some(managed) => {
-            tokio::join!(public_server, async {
-                managed
-                    .serve(shutdown.clone())
-                    .await
-                    .inspect_err(|e| eprintln!("[llmman] managed listener failed: {e:#}"))
-            })
+        Some((cert, key)) => {
+            // Both rustls providers are compiled in (reqwest's, the AWS
+            // SDK's), so none is the default until one is installed.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "load TLS certificate {} and key {}",
+                        cert.display(),
+                        key.display()
+                    )
+                })?;
+            let handle = axum_server::Handle::new();
+            tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    shutdown_signal().await;
+                    handle.graceful_shutdown(Some(Duration::from_secs(30)));
+                }
+            });
+            axum_server::from_tcp_rustls(listener.into_std()?, config)
+                .handle(handle)
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await?
         }
-        None => (public_server.await, Ok(())),
-    };
+    }
 
     // Unload every running inference backend before exiting — the same
     // explicit unload `ollama serve` does when it traps SIGINT/SIGTERM
@@ -3972,8 +3952,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // (kill_on_drop) and SIGTERMs container ones (ModelProcess::drop), so
     // nothing is left orphaned with a model still loaded in memory.
     state.0.manager.lock().await.running.clear();
-    public?;
-    managed
+    Ok(())
 }
 
 /// Resolves when the daemon is asked to shut down: SIGINT (Ctrl-C) on all
