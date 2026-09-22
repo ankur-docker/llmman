@@ -455,6 +455,9 @@ fn upstream_ip_admission_rejects_special_use_addresses() {
         "fc00::1",
         "ff02::1",
         "2001:db8::1",
+        "3fff::",
+        "3fff::1",
+        "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
         "2001::1",
         "2002:7f00:1::",   // embeds 127.0.0.1
         "2002:0a00:1::",   // embeds 10.0.0.1
@@ -462,7 +465,7 @@ fn upstream_ip_admission_rejects_special_use_addresses() {
     ] {
         assert!(!public_upstream_ip(&ip.parse().unwrap()), "{ip}");
     }
-    for ip in ["104.18.2.1", "172.64.1.1", "2606:4700::1"] {
+    for ip in ["104.18.2.1", "172.64.1.1", "2606:4700::1", "3fff:1000::"] {
         assert!(public_upstream_ip(&ip.parse().unwrap()), "{ip}");
     }
 }
@@ -772,7 +775,14 @@ fn managed_routes_require_explicit_tls_and_enforced_daemon_auth() {
     assert!(routes(enabled(), auth::Policy::default(), true).is_err());
     assert!(routes(enabled(), auth::Policy::with_keys(["key"]).optional(), true).is_err());
     assert!(routes(enabled(), auth::Policy::with_keys(["key"]), false).is_err());
-    assert!(routes(enabled(), auth::Policy::with_keys(["key"]), true).is_ok());
+    let supported = routes(enabled(), auth::Policy::with_keys(["key"]), true);
+    assert_eq!(supported.is_ok(), cfg!(unix));
+    if !cfg!(unix) {
+        assert!(supported
+            .unwrap_err()
+            .to_string()
+            .contains("ACLs can be verified"));
+    }
     assert!(routes(
         crate::config::Managed::default(),
         auth::Policy::default(),
@@ -782,8 +792,17 @@ fn managed_routes_require_explicit_tls_and_enforced_daemon_auth() {
 }
 
 #[tokio::test]
-async fn peer_admission_ignores_forwarded_headers_and_refuses_missing_peer() {
-    for peer in [None, Some("192.0.2.1:1234".parse::<SocketAddr>().unwrap())] {
+async fn peer_admission_normalizes_loopback_and_ignores_forwarded_headers() {
+    for (peer, expected) in [
+        (None, StatusCode::FORBIDDEN),
+        (Some("192.0.2.1:1234"), StatusCode::FORBIDDEN),
+        (Some("[::ffff:192.0.2.1]:1234"), StatusCode::FORBIDDEN),
+        (Some("[::127.0.0.1]:1234"), StatusCode::FORBIDDEN),
+        (Some("127.0.0.1:1234"), StatusCode::OK),
+        (Some("[::1]:1234"), StatusCode::OK),
+        (Some("[::ffff:127.0.0.1]:1234"), StatusCode::OK),
+    ] {
+        let peer = peer.map(|peer| peer.parse::<SocketAddr>().unwrap());
         let app = router(state("http://127.0.0.1:9")).layer(middleware::from_fn(
             move |mut req: Request, next: Next| async move {
                 req.extensions_mut().remove::<ConnectInfo<SocketAddr>>();
@@ -805,7 +824,7 @@ async fn peer_admission_ignores_forwarded_headers_and_refuses_missing_peer() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), expected, "{peer:?}");
     }
 }
 
@@ -1110,4 +1129,105 @@ async fn shared_tls_listener_serves_public_and_authenticated_managed_routes() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.text().await.unwrap(), "forwarded");
+}
+
+#[tokio::test]
+async fn escaped_credentials_are_redacted_from_json_error_strings_and_keys() {
+    for (token, account) in [
+        ("token\"part", "account\\part"),
+        ("token\\part/one", "account\"part/two"),
+    ] {
+        let error_body = json!({"error": {
+            "message": format!("upstream {token} for {account}"),
+            "details": [{token: account}],
+            "code": 42,
+        }})
+        .to_string()
+        .replace('/', "\\/")
+        .replace("part", "\\u0070art");
+        let upstream = serve(Router::new().fallback(move || {
+            let body = error_body.clone();
+            async move {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [("content-type", "application/json")],
+                    body,
+                )
+            }
+        }))
+        .await;
+        let managed = serve(router(state(&upstream.url))).await;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/api/codex/responses", managed.url))
+            .header(CONNECTION_KEY, "connection-secret")
+            .header(UPSTREAM_IP, "104.18.2.1")
+            .bearer_auth(token)
+            .header("chatgpt-account-id", account)
+            .json(&json!({"model":MODEL}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error": {
+                "message": "upstream <redacted> for <redacted>",
+                "details": [{"<redacted>": "<redacted>"}],
+                "code": 42,
+            }})
+        );
+    }
+}
+
+#[tokio::test]
+async fn content_coding_is_validated_before_rewriting_requests_or_redacting_errors() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let upstream = serve(Router::new().fallback(post(move |headers: HeaderMap| {
+        let count = count.clone();
+        async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            assert!(!headers.contains_key("content-encoding"));
+            assert_eq!(headers["content-type"], "application/json");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("content-encoding", "Identity, IDENTITY")],
+                "provider-secret",
+            )
+        }
+    })))
+    .await;
+    let managed = serve(router(state(&upstream.url))).await;
+    for encoding in ["gzip", "br", "identity, gzip", "", "identity,"] {
+        let response = request(&managed.url, "responses")
+            .header("content-encoding", encoding)
+            .json(&json!({"model":MODEL}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{encoding}"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    for encoding in [
+        None,
+        Some("identity"),
+        Some("Identity"),
+        Some("IDENTITY, identity"),
+    ] {
+        let mut req = request(&managed.url, "responses").json(&json!({"model":MODEL}));
+        if let Some(encoding) = encoding {
+            req = req.header("content-encoding", encoding);
+        }
+        let response = req.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.text().await.unwrap(), "<redacted>");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
 }

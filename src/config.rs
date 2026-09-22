@@ -148,9 +148,16 @@ pub fn managed() -> Result<Managed, String> {
 fn managed_from_files(files: &[File]) -> Result<Managed, String> {
     let mut managed = Managed::default();
     for file in files {
-        let conf = &file.conf.managed;
+        managed.apply(&file.conf.managed)?;
+    }
+    Ok(managed)
+}
+
+impl Managed {
+    /// Shared by parse-time validation and field-by-field configuration merging.
+    fn apply(&mut self, conf: &ManagedConf) -> Result<(), String> {
         if let Some(enabled) = &conf.enabled {
-            managed.enabled = enabled
+            self.enabled = enabled
                 .parse()
                 .map_err(|_| "managed.enabled must be \"true\" or \"false\"".to_string())?;
         }
@@ -158,11 +165,11 @@ fn managed_from_files(files: &[File]) -> Result<Managed, String> {
             let seconds: u32 = seconds.parse().map_err(|_| {
                 "managed.read_timeout_seconds must be an unsigned 32-bit integer".to_string()
             })?;
-            managed.read_timeout =
+            self.read_timeout =
                 (seconds != 0).then(|| std::time::Duration::from_secs(seconds.into()));
         }
+        Ok(())
     }
-    Ok(managed)
 }
 
 impl std::fmt::Debug for AuthConf {
@@ -433,6 +440,7 @@ pub(crate) fn parse(text: &str) -> Result<Conf, String> {
 /// What the TOML shape alone cannot say, checked at parse time so
 /// `llmman config set` refuses it on the spot.
 fn validate(conf: &Conf) -> Result<(), String> {
+    Managed::default().apply(&conf.managed)?;
     let mut seen: HashMap<String, &str> = HashMap::new();
     for (host, r) in &conf.registries {
         let canonical = canonical_registry_host(host).ok_or_else(|| {
@@ -1128,7 +1136,7 @@ mod tests {
             "[managed]\nread_timeout_seconds = \"-1\"",
             "[managed]\nread_timeout_seconds = \"4294967296\"",
         ] {
-            assert!(managed_from_files(&[file(text)]).is_err(), "{text}");
+            assert!(parse(text).is_err(), "{text}");
         }
         assert!(parse("[managed]\nenabled = true").is_err());
         assert!(parse("[managed]\nenabeld = \"true\"").is_err());

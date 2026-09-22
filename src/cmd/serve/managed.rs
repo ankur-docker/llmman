@@ -79,6 +79,10 @@ pub(super) fn routes(
         return Ok(Router::new());
     }
     anyhow::ensure!(
+        cfg!(unix),
+        "managed forwarding is unavailable on this platform until owner-only key ACLs can be verified"
+    );
+    anyhow::ensure!(
         tls,
         "managed forwarding requires LLMMAN_TLS_CERT/LLMMAN_TLS_KEY"
     );
@@ -168,7 +172,7 @@ async fn require_connection(
     let local = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .is_some_and(|peer| peer.0.ip().is_loopback());
+        .is_some_and(|peer| peer.0.ip().to_canonical().is_loopback());
     if !local {
         return error(
             StatusCode::FORBIDDEN,
@@ -293,6 +297,38 @@ impl Credentials {
                 |account| text.replace(account, "<redacted>"),
             )
     }
+
+    /// Decode JSON strings before redaction so escaped quotes, backslashes,
+    /// slashes, and Unicode escapes cannot conceal credentials on the wire.
+    fn redact_error_body(&self, bytes: &[u8]) -> String {
+        fn redact_value(credentials: &Credentials, value: &mut Value) {
+            match value {
+                Value::String(text) => *text = credentials.redact(std::mem::take(text)),
+                Value::Array(values) => {
+                    for value in values {
+                        redact_value(credentials, value);
+                    }
+                }
+                Value::Object(values) => {
+                    *values = std::mem::take(values)
+                        .into_iter()
+                        .map(|(key, mut value)| {
+                            redact_value(credentials, &mut value);
+                            (credentials.redact(key), value)
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        match serde_json::from_slice::<Value>(bytes) {
+            Ok(mut value) => {
+                redact_value(self, &mut value);
+                value.to_string()
+            }
+            Err(_) => self.redact(String::from_utf8_lossy(bytes).into_owned()),
+        }
+    }
 }
 
 // The caller authorizes this address against its network policy.
@@ -318,6 +354,7 @@ fn public_upstream_ip(ip: &IpAddr) -> bool {
             words[0] & 0xe000 == 0x2000
                 && words[0] != 0x2002
                 && !(words[0] == 0x2001 && (words[1] < 0x0200 || words[1] == 0x0db8))
+                && !(words[0] == 0x3fff && words[1] & 0xf000 == 0) // RFC 9637: 3fff::/20
         }
     }
 }
@@ -446,6 +483,17 @@ fn log_upstream_error(credentials: &Credentials, err: reqwest::Error) {
     );
 }
 
+/// Content-coding tokens are case-insensitive, including in combined fields.
+fn identity_encoding(headers: &HeaderMap) -> bool {
+    headers.get_all("content-encoding").iter().all(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+        })
+    })
+}
+
 async fn forward(
     state: ManagedState,
     headers: HeaderMap,
@@ -453,6 +501,12 @@ async fn forward(
     profile: Profile,
     operation: &'static str,
 ) -> Result<Response, AppError> {
+    if !identity_encoding(&headers) {
+        return Err(error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "encoded managed request bodies are not supported",
+        ));
+    }
     let credentials = Credentials::parse(&headers, profile)?;
     let NativeRequest(mut body) = serde_json::from_slice(&body)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid native inference request"))?;
@@ -491,6 +545,7 @@ async fn forward(
         })?;
     let mut forwarded = forward_headers(&headers);
     forwarded.remove("content-type");
+    forwarded.remove("content-encoding");
     forwarded.remove("accept-encoding");
     if profile == Profile::Claude {
         // These are singular protocol fields, unlike general extension headers.
@@ -547,12 +602,7 @@ async fn forward(
         }
     }
     let body = if status.is_client_error() || status.is_server_error() {
-        if upstream
-            .headers()
-            .get_all("content-encoding")
-            .iter()
-            .any(|value| value.as_bytes() != b"identity")
-        {
+        if !identity_encoding(upstream.headers()) {
             return Err(error(
                 StatusCode::BAD_GATEWAY,
                 "encoded provider error body refused",
@@ -574,7 +624,7 @@ async fn forward(
             }
             bytes.extend_from_slice(&chunk);
         }
-        Body::from(credentials.redact(String::from_utf8_lossy(&bytes).into_owned()))
+        Body::from(credentials.redact_error_body(&bytes))
     } else {
         // No detached pump: dropping the downstream body drops the reqwest
         // stream and cancels the upstream. Never retry or buffer generation.

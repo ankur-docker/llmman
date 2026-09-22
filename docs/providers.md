@@ -285,7 +285,7 @@ listener. The caller owns login, refresh, account selection, authorization,
 and network policy. llmman never persists these request-local OAuth tokens or
 falls back to stored provider keys, environment credentials, or peers.
 
-Every forwarding request must come from a loopback connection and supply both:
+Every forwarding request must come from a loopback connection and supply all of:
 
 ```text
 X-Api-Key: <configured daemon API key>
@@ -311,6 +311,8 @@ never sent to Anthropic. The exact nonempty model suffix is forwarded after
 removing the table's prefix. Other native payload fields are preserved; invalid
 credentials, mismatched model prefixes, and duplicate top-level JSON fields
 are rejected before contacting a provider. Request bodies are bounded to 32 MiB.
+Encoded request bodies are rejected with 415; absent or case-insensitive
+`identity` content coding is accepted and removed before JSON is reserialized.
 
 The supervisor resolves the fixed provider hostname, authorizes a particular
 IP against its network policy, and supplies that numeric address in
@@ -333,11 +335,14 @@ Successful response bodies stream with backpressure and cancellation on
 disconnect. Upstream connection establishment has a 30-second timeout; reads
 have no deadline unless `managed.read_timeout_seconds` is configured. That
 optional timeout applies to response-header waits and individual stalled reads,
-not total generation duration. A quiet generation can exceed it, so choose a
+not total generation duration. A continuously active stream can outlive this
+limit; a quiet generation is interrupted when the limit expires. Choose a
 value appropriate for the workload.
 
 Provider error statuses are preserved with bearer/account values redacted from
-error bodies and response headers. Error bodies above 1 MiB, interrupted reads,
+error bodies and response headers. JSON error bodies are decoded before
+redacting string values and keys, so escaped credentials are removed too.
+Error bodies above 1 MiB, interrupted reads,
 redirects, and encoded error bodies that cannot be safely redacted produce 502.
 llmman requests uncompressed upstream responses. Transport diagnostics are
 redacted and available with debug logging. A failure after streaming headers

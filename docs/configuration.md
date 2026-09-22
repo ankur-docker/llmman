@@ -88,7 +88,8 @@ enabled = "true"
 
 Use `llmman config set managed.enabled true` and, if desired,
 `llmman config set managed.read_timeout_seconds 600`. Values are strings,
-matching the other sections; invalid booleans or timeout values fail startup.
+matching the other sections. Invalid booleans or timeout values are rejected
+before `config set` saves the file, and also when the daemon reads it.
 Later files override individual fields. No additional configuration file is used.
 
 Managed forwarding requires the existing `LLMMAN_TLS_CERT` and `LLMMAN_TLS_KEY`
@@ -96,6 +97,9 @@ settings and a matching HTTPS `LLMMAN_HOST`. The TLS private key must pass the
 existing owner-only file permission check, as must configuration files supplying
 daemon API keys. Missing keys, plaintext HTTP,
 or `LLMMAN_AUTH=off` prevent startup when managed forwarding is enabled.
+Managed forwarding is currently supported only on Unix platforms. On Windows
+and other non-Unix platforms, enabling it fails startup because owner-only key
+ACLs cannot yet be verified. Ordinary daemon operation remains available.
 
 Only loopback peers can use the forwarding routes, even when the daemon also
 serves ordinary routes on a network interface. The client sends its daemon key
