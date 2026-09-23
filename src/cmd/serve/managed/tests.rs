@@ -1085,7 +1085,7 @@ async fn shared_tls_listener_serves_public_and_authenticated_managed_routes() {
         })),
     )
     .await;
-    let mut app_state = super::super::tests::test_state();
+    let mut app_state = super::super::test_support::test_state();
     Arc::get_mut(&mut app_state.0).unwrap().auth = auth::Policy::with_keys(["connection-secret"]);
     let app = super::super::build_router(app_state, false).merge(router(state(&upstream.url)));
     let (server, cert, _) = serve_tls(app, "127.0.0.1").await;
